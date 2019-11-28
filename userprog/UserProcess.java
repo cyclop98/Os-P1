@@ -5,6 +5,9 @@ import nachos.threads.*;
 import nachos.userprog.*;
 
 import java.io.EOFException;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.ListIterator;
 
 /**
  * Encapsulates the state of a user process that is not contained in its
@@ -34,6 +37,10 @@ public class UserProcess {
     
         fileNames[fdStandardOutput] = "stdout";
         files[fdStandardOutput] = UserKernel.console.openForWriting();    
+        cprocesses = new LinkedList<UserProcess>(); // childProcesses
+		pprocess = null; // parentProcesses
+		estats = new HashMap<Integer,Integer>(); // exitStatuses
+		mlock = new Lock(); //mapLock
     }
     
     /**
@@ -332,7 +339,7 @@ public class UserProcess {
 	int argsSize = 0;
 	for (int i=0; i<args.length; i++) {
 	    argv[i] = args[i].getBytes();
-	    // 4 bytes for argv[] argsAddress; then string plus one for null byte
+	    // 4 bytes for argv[] pointer; then string plus one for null byte
 	    argsSize += 4 + argv[i].length + 1;
 	}
 	if (argsSize > pageSize) {
@@ -344,7 +351,7 @@ public class UserProcess {
 	// program counter initially points at the program entry point
 	initialPC = coff.getEntryPoint();	
 
-	// next comes the stack; stack argsAddress initially points to top of it
+	// next comes the stack; stack pointer initially points to top of it
 	numPages += stackPages;
 	initialSP = numPages*pageSize;
 
@@ -410,13 +417,13 @@ public class UserProcess {
      * Release any resources allocated by <tt>loadSections()</tt>.
      */
     protected void unloadSections() {
-        UserKernal.lock.aquire();
+        UserKernel.lock.aquire();
 
         for(int i = 0 ; i < numPages; i++){
-            UserKernal.availablePages.add(pageTable[i].ppn);
+            UserKernel.availablePages.add(pageTable[i].ppn);
         }
         
-        UserKernal.lock.release();
+        UserKernel.lock.release();
 
         for(int i = 0; i < 16; i++){
             if(FileDescriptorTable[i] != null){
@@ -430,7 +437,7 @@ public class UserProcess {
     /**
      * Initialize the processor's registers in preparation for running the
      * program loaded into this process. Set the PC register to point at the
-     * start function, set the stack argsAddress register to point at the top of
+     * start function, set the stack pointer register to point at the top of
      * the stack, set the A0 and A1 registers to argc and argv, respectively,
      * and initialize all other registers to 0.
      */
@@ -469,10 +476,65 @@ public class UserProcess {
 	Lib.assertNotReached("Machine.halt() did not halt machine!");
 	return 0;
     }
+    // START OF PART 3
+    
+ 	private int handleExit(int stat){ // status
+ 		coff.close();
+ 		if (pprocess != null)
+ 		{
+ 			pprocess.mlock.acquire();
+ 			pprocess.estats.put(pid, stat);
+ 			pprocess.mlock.release();
+ 			pprocess.cprocesses.remove(this);
+ 		}
+ 		unloadSections();
+ 		if (pid == 0) {
+ 			Kernel.kernel.terminate(); //root exiting
+ 		} else {
+ 			UThread.finish();
+ 		}
+ 		return stat;
+ 	}
 
+ 	private int handleJoin(int pid, int saddr){ //
+ 		UserProcess cprocess = null;
 
-private int handleExec(int filenameaddr, int argc, int argAddress){
-	
+ 		// process matching with its pid
+ 		for (int i = 0; i < cprocesses.size(); i++) {
+ 			if(pid == cprocesses.get(i).pid) {
+ 				cprocess = cprocesses.get(i);
+ 				break;
+ 			}
+ 		}
+ 		
+ 		// pid does not match child
+ 		if(cprocess == null) {
+ 			return -1;
+ 		}
+ 		
+ 		cprocess.thread.join();
+		mlock.acquire();
+		Integer stat = estats.get(cprocess.pid);
+ 		mlock.release();
+ 		
+ 		// remove the child
+ 		cprocesses.remove(cprocess);
+ 		cprocess.pprocess = null;
+ 		
+ 		byte[] cstat = new byte[4];
+ 		Lib.bytesFromInt(cstat, 0, stat);
+ 		int numWrittenBytes = writeVirtualMemory(saddr, cstat); // (statusAddress, childStatus)
+ 		if (numWrittenBytes != 4){
+ 			return 0; // child not exited
+ 			}
+ 		else
+ 		{
+ 			return 1; // child exited
+ 			}	
+ 		}
+
+ 	private int handleExec(int filenameaddr, int argc, int argAddress){
+ 		
 		String filename = readVirtualMemoryString(filenameaddr, 256);
 		if (filename == null || filenameaddr < 0){    // Check string filename
 				return -1;
@@ -500,14 +562,17 @@ private int handleExec(int filenameaddr, int argc, int argAddress){
 
 		UserProcess cprocess = UserProcess.newUserProcess();
 		if (cprocess.execute(filename, argument)){
-			cprocess.parentProcess = this;
-			this.childProcesses.add(cprocess);
+			cprocess.pprocess = this; // parent process
+			this.cprocesses.add(cprocess);
 			return cprocess.pid;
 		}else{
 			return -1;
 		} 	
 }
- 
+
+
+ 	
+ 	// END OF PART 3
     /**
      * Attempt to open the named disk file, creating it if it does not exist,
      * and return a file descriptor that can be used to access the file.
@@ -803,12 +868,6 @@ private int handleExec(int filenameaddr, int argc, int argAddress){
 
     /** The program being run by this process. */
     protected Coff coff;
-    
-	private UserProcess childProcesses ;
-	childProcesses = new LinkedList<UserProcess>();
-	private UserProcess parentProcess;
-	parentProcess = null;	
-	private int pid; //ProcessID
 
     /** This process's page table. */
     protected TranslationEntry[] pageTable;
@@ -827,7 +886,13 @@ private int handleExec(int filenameaddr, int argc, int argAddress){
     // File descriptors of stdin and stdout
     private static final int fdStandardInput = 0;
     private static final int fdStandardOutput = 1;
-
+    //Part 3
+    private LinkedList<UserProcess> cprocesses;
+	private UserProcess pprocess;
+	private int pid;
+	private Lock mlock;
+	private HashMap<Integer,Integer> estats;
+	private UThread thread;
     /// Index of the 3 arrays act as file descriptors
     // Array of files
     private static final int MAX_FD = 16;
